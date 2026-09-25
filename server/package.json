@@ -1,0 +1,16 @@
+{
+  "name": "duo-call-signal",
+  "version": "1.0.0",
+  "description": "Tiny PeerJS signaling server for Duo Call (carries no audio or video)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "peer": "^1.0.2"
+  }
+}

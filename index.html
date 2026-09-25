@@ -65,6 +65,7 @@
   </div>
 </main>
 
+<script src="config.js"></script>
 <script type="module">
 import { RnnoiseWorkletNode, loadRnnoise, GtcrnWorkletNode, loadGtcrn, NoiseGateWorkletNode } from './vendor/noise-suppressor.js';
 
@@ -75,6 +76,8 @@ import { RnnoiseWorkletNode, loadRnnoise, GtcrnWorkletNode, loadGtcrn, NoiseGate
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' }
   ] };
+  // signaling server settings come from config.js (null = the free public PeerJS server)
+  const peerOpts = () => Object.assign({ config: ICE }, window.DUO_SIGNAL || {});
   const SCREEN_MAX_BITRATE = 2500000; // bits/s, keeps upload manageable
   const $ = id => document.getElementById(id);
 
@@ -285,7 +288,7 @@ import { RnnoiseWorkletNode, loadRnnoise, GtcrnWorkletNode, loadGtcrn, NoiseGate
     if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
     isHost = false;
     setStatus('Connecting...');
-    const p = new Peer(roomPeerId, { config: ICE });
+    const p = new Peer(roomPeerId, peerOpts());
     peer = p;
     p.on('open', () => {
       if (peer !== p) return;
@@ -314,7 +317,7 @@ import { RnnoiseWorkletNode, loadRnnoise, GtcrnWorkletNode, loadGtcrn, NoiseGate
 
   function joinAsGuest() {
     if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
-    const p = new Peer({ config: ICE });
+    const p = new Peer(peerOpts());
     peer = p;
     p.on('open', () => {
       if (peer !== p) return;
