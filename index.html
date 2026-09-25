@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call Room (2 people)</title>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  :root { color-scheme: dark; --bg:#111; --panel:#1b1b1b; --line:#333; --fg:#eee; --mute:#999; --accent:#3b82f6; --bad:#ef4444; --ok:#22c55e; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui, sans-serif; min-height:100vh; display:flex; flex-direction:column; }
+  header { padding:12px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
+  h1 { font-size:16px; margin:0; }
+  main { flex:1; padding:16px; display:flex; flex-direction:column; gap:12px; }
+  button { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:9px 14px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.off { background:var(--bad); border-color:var(--bad); color:#fff; }
+  #lobby { margin:auto; text-align:center; max-width:420px; display:flex; flex-direction:column; gap:14px; }
+  #room, #linkbox { display:none; }
+  #videos { flex:1; display:grid; grid-template-columns:1fr 1fr; gap:12px; min-height:0; }
+  @media (max-width:720px) { #videos { grid-template-columns:1fr; } }
+  .tile { position:relative; background:#000; border:1px solid var(--line); border-radius:10px; overflow:hidden; min-height:220px; }
+  .tile video { width:100%; height:100%; object-fit:contain; display:block; background:#000; }
+  .tile span { position:absolute; left:8px; bottom:8px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:6px; font-size:12px; }
+  #controls { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
+  #stats { font:12px ui-monospace, Consolas, monospace; color:var(--mute); }
+  #status { color:var(--mute); }
+  #linkbox { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px; gap:8px; align-items:center; }
+  #linkbox input { flex:1; background:transparent; color:var(--fg); border:0; font:inherit; min-width:0; }
+  .good { color:var(--ok); } .bad { color:var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Call Room &middot; max 2 people</h1>
+  <div id="stats">not connected</div>
+</header>
+<main>
+  <div id="lobby">
+    <p>Free peer-to-peer call. Audio, video and screen share go directly between the two browsers.</p>
+    <button class="primary" id="createBtn">Create room</button>
+    <div id="lobbyMsg" class="bad"></div>
+  </div>
+
+  <div id="room">
+    <div id="linkbox"><input id="linkInput" readonly><button id="copyBtn">Copy link</button></div>
+    <div id="status"></div>
+    <div id="videos">
+      <div class="tile"><video id="remoteVideo" autoplay playsinline></video><span>Them</span></div>
+      <div class="tile"><video id="localVideo" autoplay playsinline muted></video><span>You</span></div>
+    </div>
+    <div id="controls">
+      <button id="micBtn">Mute mic</button>
+      <button id="denoiseBtn" class="primary">Noise cancel: ON</button>
+      <button id="camBtn">Camera off</button>
+      <button id="shareBtn">Share screen</button>
+      <button id="leaveBtn">Leave</button>
+    </div>
+  </div>
+</main>
+
+<script type="module">
+import { RnnoiseWorkletNode, loadRnnoise } from './vendor/noise-suppressor.js';
+
+(function () {
+  'use strict';
+
+  const ICE = { iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' }
+  ] };
+  const SCREEN_MAX_BITRATE = 2500000; // bits/s, keeps upload manageable
+  const $ = id => document.getElementById(id);
+
+  let peer = null, call = null, localStream = null, sendStream = null, cameraTrack = null, screenTrack = null;
+  let audioCtx = null, micSource = null, rnnoiseNode = null, denoiseDest = null, denoiseOn = false;
+  let statsTimer = null, prevBytes = null;
+  const roomFromUrl = new URLSearchParams(location.search).get('room');
+
+  function setStatus(t) { $('status').textContent = t; }
+  function showRoom() { $('lobby').style.display = 'none'; $('room').style.display = 'flex'; $('room').style.flexDirection = 'column'; $('room').style.gap = '12px'; $('room').style.flex = '1'; }
+  function randomId() {
+    const a = 'abcdefghjkmnpqrstuvwxyz23456789'; let s = '';
+    const r = crypto.getRandomValues(new Uint8Array(10));
+    for (const b of r) s += a[b % a.length];
+    return s;
+  }
+
+  async function getMedia() {
+    if (localStream) return localStream;
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }
+      });
+    } catch (e) {
+      // fall back to audio only
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+    cameraTrack = localStream.getVideoTracks()[0] || null;
+    $('localVideo').srcObject = localStream;
+    sendStream = await buildSendStream();
+    return localStream;
+  }
+
+  // Mic -> RNNoise (WASM, runs locally) -> the track that is sent to the peer.
+  // The sent audio track never changes; the toggle only re-routes the graph.
+  async function buildSendStream() {
+    const out = new MediaStream();
+    if (cameraTrack) out.addTrack(cameraTrack);
+    const mic = localStream.getAudioTracks()[0];
+    if (!mic) return out;
+    try {
+      audioCtx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' }); // RNNoise needs 48 kHz
+      await audioCtx.audioWorklet.addModule('./vendor/rnnoise-worklet.js');
+      const wasmBinary = await loadRnnoise({ url: './vendor/rnnoise.wasm', simdUrl: './vendor/rnnoise_simd.wasm' });
+      rnnoiseNode = new RnnoiseWorkletNode(audioCtx, { maxChannels: 1, wasmBinary });
+      rnnoiseNode.channelCount = 1; rnnoiseNode.channelCountMode = 'explicit';
+      micSource = audioCtx.createMediaStreamSource(new MediaStream([mic]));
+      denoiseDest = audioCtx.createMediaStreamDestination();
+      denoiseDest.channelCount = 1;
+      rnnoiseNode.connect(denoiseDest);
+      out.addTrack(denoiseDest.stream.getAudioTracks()[0]);
+      await audioCtx.resume();
+      await setDenoise(true);
+    } catch (e) {
+      console.warn('RNNoise unavailable, sending raw mic audio:', e);
+      out.addTrack(mic);
+      const b = $('denoiseBtn'); if (b) { b.disabled = true; b.textContent = 'Noise cancel n/a'; }
+    }
+    return out;
+  }
+
+  // on: RNNoise, browser suppression off (avoid double processing). off: raw path with browser suppression.
+  async function setDenoise(on) {
+    if (!micSource) return;
+    denoiseOn = on;
+    micSource.disconnect();
+    micSource.connect(on ? rnnoiseNode : denoiseDest);
+    const mic = localStream.getAudioTracks()[0];
+    try { await mic.applyConstraints({ noiseSuppression: !on, echoCancellation: true, autoGainControl: true }); } catch (e) {}
+    const b = $('denoiseBtn');
+    b.textContent = on ? 'Noise cancel: ON' : 'Noise cancel: OFF';
+    b.classList.toggle('primary', on);
+  }
+
+  function attachCall(c) {
+    call = c;
+    let gotStream = false;
+    c.on('stream', remote => {
+      gotStream = true;
+      $('remoteVideo').srcObject = remote;
+      setStatus('Connected');
+      startStats();
+    });
+    c.on('close', () => {
+      stopStats();
+      $('remoteVideo').srcObject = null;
+      if (!gotStream && roomFromUrl) setStatus('Room is full or the host left. Ask for a new link.');
+      else setStatus(roomFromUrl ? 'Call ended.' : 'The other person left. Waiting for someone to join the link...');
+      call = null;
+    });
+    c.on('error', e => setStatus('Call error: ' + e.type));
+  }
+
+  async function createRoom() {
+    $('lobbyMsg').textContent = '';
+    try { await getMedia(); } catch (e) { $('lobbyMsg').textContent = 'Camera/mic blocked: ' + e.message; return; }
+    const id = randomId();
+    peer = new Peer(id, { config: ICE });
+    peer.on('open', rid => {
+      showRoom();
+      const link = location.origin + location.pathname + '?room=' + rid;
+      $('linkInput').value = link; $('linkbox').style.display = 'flex';
+      history.replaceState(null, '', '?host=' + rid);
+      setStatus('Room ready. Send the link to the other person and keep this tab open.');
+    });
+    peer.on('call', incoming => {
+      if (call) { incoming.close(); return; } // enforce 2-person limit
+      incoming.answer(sendStream);
+      attachCall(incoming);
+    });
+    peer.on('error', e => {
+      if (e.type === 'unavailable-id') createRoom();
+      else setStatus('Connection error: ' + e.type);
+    });
+  }
+
+  async function joinRoom(room) {
+    try { await getMedia(); } catch (e) { $('lobbyMsg').textContent = 'Camera/mic blocked: ' + e.message; return; }
+    showRoom();
+    setStatus('Connecting...');
+    peer = new Peer({ config: ICE });
+    peer.on('open', () => attachCall(peer.call(room, sendStream)));
+    peer.on('error', e => setStatus(e.type === 'peer-unavailable' ? 'Room not found. Is the host tab still open?' : 'Connection error: ' + e.type));
+  }
+
+  // ---- controls ----
+  $('createBtn').onclick = createRoom;
+  $('copyBtn').onclick = () => { navigator.clipboard.writeText($('linkInput').value); $('copyBtn').textContent = 'Copied'; setTimeout(() => $('copyBtn').textContent = 'Copy link', 1500); };
+
+  $('micBtn').onclick = () => {
+    const t = localStream && localStream.getAudioTracks()[0]; if (!t) return;
+    t.enabled = !t.enabled;
+    $('micBtn').textContent = t.enabled ? 'Mute mic' : 'Unmute mic';
+    $('micBtn').classList.toggle('off', !t.enabled);
+  };
+  $('denoiseBtn').onclick = () => setDenoise(!denoiseOn);
+  $('camBtn').onclick = () => {
+    if (!cameraTrack) return;
+    cameraTrack.enabled = !cameraTrack.enabled;
+    $('camBtn').textContent = cameraTrack.enabled ? 'Camera off' : 'Camera on';
+    $('camBtn').classList.toggle('off', !cameraTrack.enabled);
+  };
+
+  function videoSender() {
+    if (!call || !call.peerConnection) return null;
+    return call.peerConnection.getSenders().find(s => s.track && s.track.kind === 'video')
+        || call.peerConnection.getSenders().find(s => s.track === null);
+  }
+  async function capBitrate(sender, bps) {
+    const p = sender.getParameters(); if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+    p.encodings[0].maxBitrate = bps; try { await sender.setParameters(p); } catch (e) {}
+  }
+  async function startShare() {
+    const sender = videoSender();
+    if (!sender) { setStatus('Connect to the other person before sharing.'); return; }
+    let s;
+    try { s = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 } }, audio: false }); }
+    catch (e) { return; }
+    screenTrack = s.getVideoTracks()[0];
+    screenTrack.contentHint = 'detail';
+    await sender.replaceTrack(screenTrack);
+    await capBitrate(sender, SCREEN_MAX_BITRATE);
+    $('localVideo').srcObject = s;
+    $('shareBtn').textContent = 'Stop sharing'; $('shareBtn').classList.add('off');
+    screenTrack.onended = stopShare;
+  }
+  async function stopShare() {
+    if (!screenTrack) return;
+    screenTrack.stop(); screenTrack = null;
+    const sender = videoSender();
+    if (sender && cameraTrack) { await sender.replaceTrack(cameraTrack); await capBitrate(sender, 2000000); }
+    $('localVideo').srcObject = localStream;
+    $('shareBtn').textContent = 'Share screen'; $('shareBtn').classList.remove('off');
+  }
+  $('shareBtn').onclick = () => screenTrack ? stopShare() : startShare();
+  $('leaveBtn').onclick = () => { if (call) call.close(); if (peer) peer.destroy(); if (localStream) localStream.getTracks().forEach(t => t.stop()); location.href = location.pathname; };
+
+  // ---- connection stats: shows whether the path is direct and the round-trip time ----
+  function startStats() { stopStats(); statsTimer = setInterval(readStats, 2000); readStats(); }
+  function stopStats() { clearInterval(statsTimer); statsTimer = null; prevBytes = null; $('stats').textContent = 'not connected'; }
+  async function readStats() {
+    if (!call || !call.peerConnection) return;
+    const report = await call.peerConnection.getStats();
+    let pair = null; const cands = {}; let bytes = 0;
+    report.forEach(r => {
+      if (r.type === 'candidate-pair' && (r.nominated || r.selected) && r.state === 'succeeded') pair = r;
+      if (r.type === 'local-candidate' || r.type === 'remote-candidate') cands[r.id] = r;
+      if (r.type === 'outbound-rtp' && r.kind === 'video') bytes += r.bytesSent || 0;
+    });
+    if (!pair) return;
+    const l = cands[pair.localCandidateId], r = cands[pair.remoteCandidateId];
+    const relayed = (l && l.candidateType === 'relay') || (r && r.candidateType === 'relay');
+    const rtt = pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null;
+    let kbps = '';
+    if (prevBytes != null) kbps = ' | up ' + Math.round((bytes - prevBytes) * 8 / 2000) + ' kbps';
+    prevBytes = bytes;
+    $('stats').innerHTML = (relayed ? '<span class="bad">RELAYED</span>' : '<span class="good">DIRECT</span>')
+      + ' | RTT ' + (rtt != null ? rtt + ' ms' : '?') + kbps;
+  }
+
+  // ---- entry ----
+  if (roomFromUrl) {
+    $('lobby').innerHTML = '<p>You were invited to a call.</p><button class="primary" id="joinBtn">Join call</button><div id="lobbyMsg" class="bad"></div>';
+    $('joinBtn').onclick = () => joinRoom(roomFromUrl);
+  }
+})();
+</script>
+</body>
+</html>
