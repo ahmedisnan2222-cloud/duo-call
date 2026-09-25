@@ -17,11 +17,16 @@ Upload this folder to Netlify Drop, Cloudflare Pages or GitHub Pages. No build s
 3. Top-right shows DIRECT or RELAYED plus round-trip time (ms).
 
 ## Noise cancellation
-Mic audio passes through RNNoise (WebAssembly, runs in the browser, nothing leaves the device) before
-it is sent. The "Noise cancel" button toggles it. ON = RNNoise with the browser's own suppression off;
-OFF = the browser's built-in suppression only. Files are in `vendor/` (from @sapphi-red/web-noise-suppressor,
-see `vendor/LICENSE-web-noise-suppressor`). If it fails to load, the call falls back to plain mic audio.
-Because the page now loads ES modules and a worklet, it must be served over http(s), not opened as a file.
+Three independent buttons, all running locally in the browser (nothing leaves the device):
+- **RNNoise** (on by default): light, fast ML noise removal.
+- **GTCRN**: newer ML model, better on keyboard clicks and background voices, uses more CPU.
+- **Noise gate**: mutes the mic below a threshold (slider + live level meter). Set the threshold between your
+  room noise and your speaking level.
+They chain in that order and can be combined (stacking both ML models can sound over-processed). The browser's own
+suppression is only active when neither ML model is on. Each person's buttons change only how THEIR mic sounds to
+the other side. Files are in vendor/ (from @sapphi-red/web-noise-suppressor, see vendor/LICENSE-web-noise-suppressor).
+If loading fails, the call falls back to plain mic audio. The page uses ES modules and audio worklets, so it must be
+served over http(s), not opened as a file.
 
 ## Known limits
 - No TURN relay: if a network blocks direct connections, that user cannot connect.

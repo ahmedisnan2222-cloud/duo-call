@@ -24,6 +24,8 @@
   .tile video { width:100%; height:100%; object-fit:contain; display:block; background:#000; }
   .tile span { position:absolute; left:8px; bottom:8px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:6px; font-size:12px; }
   #controls { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
+  #gateRow { display:none; gap:10px; justify-content:center; align-items:center; flex-wrap:wrap; color:var(--mute); font-size:13px; }
+  #gateRow input { vertical-align:middle; }
   #stats { font:12px ui-monospace, Consolas, monospace; color:var(--mute); }
   #status { color:var(--mute); }
   #linkbox { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px; gap:8px; align-items:center; }
@@ -52,16 +54,19 @@
     </div>
     <div id="controls">
       <button id="micBtn">Mute mic</button>
-      <button id="denoiseBtn" class="primary">Noise cancel: ON</button>
+      <button id="rnnoiseBtn" class="primary">RNNoise: ON</button>
+      <button id="gtcrnBtn">GTCRN: OFF</button>
+      <button id="gateBtn">Noise gate: OFF</button>
       <button id="camBtn">Camera off</button>
       <button id="shareBtn">Share screen</button>
       <button id="leaveBtn">Leave</button>
     </div>
+    <div id="gateRow"><label>Gate threshold <input type="range" id="gateSlider" min="-80" max="-20" step="1" value="-50"></label> <span id="gateVal">-50 dB</span> <span>&middot; your mic level: <b id="meter">--</b></span></div>
   </div>
 </main>
 
 <script type="module">
-import { RnnoiseWorkletNode, loadRnnoise } from './vendor/noise-suppressor.js';
+import { RnnoiseWorkletNode, loadRnnoise, GtcrnWorkletNode, loadGtcrn, NoiseGateWorkletNode } from './vendor/noise-suppressor.js';
 
 (function () {
   'use strict';
@@ -74,7 +79,7 @@ import { RnnoiseWorkletNode, loadRnnoise } from './vendor/noise-suppressor.js';
   const $ = id => document.getElementById(id);
 
   let peer = null, call = null, localStream = null, sendStream = null, cameraTrack = null, screenTrack = null;
-  let audioCtx = null, micSource = null, rnnoiseNode = null, denoiseDest = null, denoiseOn = false;
+  let audioCtx = null, micSource = null, denoiseDest = null;
   let statsTimer = null, prevBytes = null;
   const roomFromUrl = new URLSearchParams(location.search).get('room');
 
@@ -104,45 +109,109 @@ import { RnnoiseWorkletNode, loadRnnoise } from './vendor/noise-suppressor.js';
     return localStream;
   }
 
-  // Mic -> RNNoise (WASM, runs locally) -> the track that is sent to the peer.
-  // The sent audio track never changes; the toggle only re-routes the graph.
+  // Mic -> [RNNoise] -> [GTCRN] -> [noise gate] -> the track that is sent to the peer.
+  // Each effect is an independent toggle and runs locally in this browser, so every person's
+  // buttons control only how THEIR mic sounds to the other side. The sent track never changes;
+  // toggling only re-routes the audio graph.
+  const FX_ORDER = ['rnnoise', 'gtcrn', 'gate'];
+  const FX_LABEL = { rnnoise: 'RNNoise', gtcrn: 'GTCRN', gate: 'Noise gate' };
+  const fx = { rnnoise: { on: true, node: null }, gtcrn: { on: false, node: null }, gate: { on: false, node: null } };
+  let gateDb = -50, analyser = null, meterTimer = null;
+
   async function buildSendStream() {
     const out = new MediaStream();
     if (cameraTrack) out.addTrack(cameraTrack);
     const mic = localStream.getAudioTracks()[0];
     if (!mic) return out;
     try {
-      audioCtx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' }); // RNNoise needs 48 kHz
-      await audioCtx.audioWorklet.addModule('./vendor/rnnoise-worklet.js');
-      const wasmBinary = await loadRnnoise({ url: './vendor/rnnoise.wasm', simdUrl: './vendor/rnnoise_simd.wasm' });
-      rnnoiseNode = new RnnoiseWorkletNode(audioCtx, { maxChannels: 1, wasmBinary });
-      rnnoiseNode.channelCount = 1; rnnoiseNode.channelCountMode = 'explicit';
+      audioCtx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' }); // the models need 48 kHz
       micSource = audioCtx.createMediaStreamSource(new MediaStream([mic]));
       denoiseDest = audioCtx.createMediaStreamDestination();
       denoiseDest.channelCount = 1;
-      rnnoiseNode.connect(denoiseDest);
-      out.addTrack(denoiseDest.stream.getAudioTracks()[0]);
+      analyser = audioCtx.createAnalyser(); analyser.fftSize = 1024;
       await audioCtx.resume();
-      await setDenoise(true);
+      await rewire(); // loads RNNoise, which is on by default
+      out.addTrack(denoiseDest.stream.getAudioTracks()[0]);
+      startMeter();
     } catch (e) {
-      console.warn('RNNoise unavailable, sending raw mic audio:', e);
+      console.warn('Noise processing unavailable, sending raw mic audio:', e);
       out.addTrack(mic);
-      const b = $('denoiseBtn'); if (b) { b.disabled = true; b.textContent = 'Noise cancel n/a'; }
+      FX_ORDER.forEach(k => { const b = $(k + 'Btn'); b.disabled = true; b.textContent = FX_LABEL[k] + ': n/a'; b.classList.remove('primary'); });
     }
     return out;
   }
 
-  // on: RNNoise, browser suppression off (avoid double processing). off: raw path with browser suppression.
-  async function setDenoise(on) {
-    if (!micSource) return;
-    denoiseOn = on;
-    micSource.disconnect();
-    micSource.connect(on ? rnnoiseNode : denoiseDest);
+  async function loadNode(kind) {
+    const f = fx[kind];
+    if (f.node) return f.node;
+    if (kind === 'rnnoise') {
+      await audioCtx.audioWorklet.addModule('./vendor/rnnoise-worklet.js');
+      const wasmBinary = await loadRnnoise({ url: './vendor/rnnoise.wasm', simdUrl: './vendor/rnnoise_simd.wasm' });
+      f.node = new RnnoiseWorkletNode(audioCtx, { maxChannels: 1, wasmBinary });
+    } else if (kind === 'gtcrn') {
+      await audioCtx.audioWorklet.addModule('./vendor/gtcrn-worklet.js');
+      const wasmBinary = await loadGtcrn({ url: './vendor/gtcrn.wasm' });
+      f.node = new GtcrnWorkletNode(audioCtx, { maxChannels: 1, wasmBinary });
+    } else {
+      await audioCtx.audioWorklet.addModule('./vendor/noise-gate-worklet.js');
+      f.node = new NoiseGateWorkletNode(audioCtx, { openThreshold: gateDb, closeThreshold: gateDb - 5, holdMs: 250, maxChannels: 1 });
+    }
+    f.node.channelCount = 1; f.node.channelCountMode = 'explicit';
+    return f.node;
+  }
+
+  // Load whatever is switched on first, then re-wire the graph in one synchronous step.
+  async function rewire() {
+    const active = FX_ORDER.filter(k => fx[k].on);
+    for (const k of active) await loadNode(k);
+    micSource.disconnect(); analyser.disconnect();
+    FX_ORDER.forEach(k => { if (fx[k].node) fx[k].node.disconnect(); });
+    let prev = micSource;
+    for (const k of active) {
+      if (k === 'gate') prev.connect(analyser); // the meter shows the level the gate sees
+      prev.connect(fx[k].node); prev = fx[k].node;
+    }
+    if (!fx.gate.on) prev.connect(analyser);
+    prev.connect(denoiseDest);
+    // browser suppression only when no ML model is active (avoids double processing)
+    const ml = fx.rnnoise.on || fx.gtcrn.on;
     const mic = localStream.getAudioTracks()[0];
-    try { await mic.applyConstraints({ noiseSuppression: !on, echoCancellation: true, autoGainControl: true }); } catch (e) {}
-    const b = $('denoiseBtn');
-    b.textContent = on ? 'Noise cancel: ON' : 'Noise cancel: OFF';
-    b.classList.toggle('primary', on);
+    try { await mic.applyConstraints({ noiseSuppression: !ml, echoCancellation: true, autoGainControl: true }); } catch (e) {}
+  }
+
+  function updateFxUi() {
+    FX_ORDER.forEach(k => {
+      const b = $(k + 'Btn'); if (b.disabled) return;
+      b.textContent = FX_LABEL[k] + ': ' + (fx[k].on ? 'ON' : 'OFF');
+      b.classList.toggle('primary', fx[k].on);
+    });
+    $('gateRow').style.display = fx.gate.on ? 'flex' : 'none';
+  }
+
+  async function toggleFx(kind) {
+    const f = fx[kind];
+    f.on = !f.on;
+    try { await rewire(); }
+    catch (e) {
+      console.warn(FX_LABEL[kind] + ' failed to load:', e);
+      f.on = false; f.node = null;
+      setStatus(FX_LABEL[kind] + ' could not be loaded in this browser.');
+      try { await rewire(); } catch (e2) {}
+    }
+    updateFxUi();
+  }
+
+  function startMeter() {
+    const buf = new Float32Array(analyser.fftSize);
+    meterTimer = setInterval(() => {
+      if (!fx.gate.on) return;
+      analyser.getFloatTimeDomainData(buf);
+      let s = 0; for (const x of buf) s += x * x;
+      const db = 10 * Math.log10(s / buf.length + 1e-12);
+      const open = db > gateDb;
+      $('meter').textContent = Math.max(-99, Math.round(db)) + ' dB ' + (open ? '(open)' : '(closed)');
+      $('meter').className = open ? 'good' : 'bad';
+    }, 150);
   }
 
   function attachCall(c) {
@@ -206,7 +275,12 @@ import { RnnoiseWorkletNode, loadRnnoise } from './vendor/noise-suppressor.js';
     $('micBtn').textContent = t.enabled ? 'Mute mic' : 'Unmute mic';
     $('micBtn').classList.toggle('off', !t.enabled);
   };
-  $('denoiseBtn').onclick = () => setDenoise(!denoiseOn);
+  FX_ORDER.forEach(k => { $(k + 'Btn').onclick = () => toggleFx(k); });
+  $('gateSlider').oninput = e => { gateDb = +e.target.value; $('gateVal').textContent = gateDb + ' dB'; };
+  $('gateSlider').onchange = async () => { // the gate takes its threshold at creation, so rebuild it
+    if (fx.gate.node) { fx.gate.node.disconnect(); fx.gate.node = null; }
+    if (fx.gate.on) { try { await rewire(); } catch (e) {} }
+  };
   $('camBtn').onclick = () => {
     if (!cameraTrack) return;
     cameraTrack.enabled = !cameraTrack.enabled;
