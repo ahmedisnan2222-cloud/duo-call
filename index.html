@@ -234,12 +234,34 @@ import { RnnoiseWorkletNode, loadRnnoise, GtcrnWorkletNode, loadGtcrn, NoiseGate
     if (!isHost) later(1000); // the guest re-enters, and becomes host if the room is free
   }
 
+  // Reports what is stopping the media path: which kinds of network addresses this browser could find
+  // (host = local, srflx = public via STUN, relay = via TURN) and the ICE state, then says what it means.
+  let diagTimer = null;
+  function startDiag(c) {
+    clearInterval(diagTimer);
+    const started = Date.now();
+    const tick = async () => {
+      if (call !== c || !c.peerConnection) { clearInterval(diagTimer); return; }
+      const pc = c.peerConnection, s = pc.iceConnectionState;
+      if (s === 'connected' || s === 'completed') { clearInterval(diagTimer); setStatus('Connected'); startStats(); return; }
+      const types = new Set();
+      try { (await pc.getStats()).forEach(r => { if (r.type === 'local-candidate') types.add(r.candidateType); }); } catch (e) {}
+      $('stats').textContent = 'ICE ' + s + ' | my address types: ' + ([...types].join(', ') || 'none yet');
+      if (s === 'failed' || Date.now() - started > 10000) {
+        setStatus(types.has('srflx') || types.has('relay')
+          ? 'Could not open a direct connection to the other person. A network or firewall on one side is blocking direct calls, and there is no relay server.'
+          : 'This browser could not reach the public STUN servers (UDP looks blocked on this network), so a direct connection is not possible.');
+      }
+    };
+    diagTimer = setInterval(tick, 1500); tick();
+  }
+
   function attachCall(c) {
     call = c;
     c.on('stream', remote => {
       $('remoteVideo').srcObject = remote;
-      setStatus('Connected');
-      startStats();
+      setStatus('Found the other person, setting up the connection...');
+      startDiag(c); // "Connected" is only shown once the network path is really up
     });
     c.on('close', () => dropCall(c));
     c.on('error', e => setStatus('Call error: ' + e.type));
@@ -382,7 +404,7 @@ import { RnnoiseWorkletNode, loadRnnoise, GtcrnWorkletNode, loadGtcrn, NoiseGate
 
   // ---- connection stats: shows whether the path is direct and the round-trip time ----
   function startStats() { stopStats(); statsTimer = setInterval(readStats, 2000); readStats(); }
-  function stopStats() { clearInterval(statsTimer); statsTimer = null; prevBytes = null; $('stats').textContent = 'not connected'; }
+  function stopStats() { clearInterval(diagTimer); clearInterval(statsTimer); statsTimer = null; prevBytes = null; $('stats').textContent = 'not connected'; }
   async function readStats() {
     if (!call || !call.peerConnection) return;
     const report = await call.peerConnection.getStats();
