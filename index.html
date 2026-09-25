@@ -85,9 +85,9 @@ import { RnnoiseWorkletNode, loadRnnoise, GtcrnWorkletNode, loadGtcrn, NoiseGate
 
   function setStatus(t) { $('status').textContent = t; }
   function showRoom() { $('lobby').style.display = 'none'; $('room').style.display = 'flex'; $('room').style.flexDirection = 'column'; $('room').style.gap = '12px'; $('room').style.flex = '1'; }
-  function randomId() {
+  function randomId(len = 16) {
     const a = 'abcdefghjkmnpqrstuvwxyz23456789'; let s = '';
-    const r = crypto.getRandomValues(new Uint8Array(10));
+    const r = crypto.getRandomValues(new Uint8Array(len));
     for (const b of r) s += a[b % a.length];
     return s;
   }
@@ -214,59 +214,117 @@ import { RnnoiseWorkletNode, loadRnnoise, GtcrnWorkletNode, loadGtcrn, NoiseGate
     }, 150);
   }
 
+  // ---- Fixed room: the same link every time ----
+  // The room is a fixed peer ID derived from a secret in the link. Whoever arrives first claims it and
+  // hosts; the other person calls it. If either side refreshes or drops, they reconnect on their own,
+  // and if the host leaves the guest takes the room over. Only two people can be connected at once.
+  const ROOM_KEY = 'duoRoomSecret';
+  let roomPeerId = null, isHost = false, leaving = false, retryTimer = null;
+
+  function later(ms) { clearTimeout(retryTimer); retryTimer = setTimeout(enter, ms); }
+
+  function dropCall(c) {
+    if (call !== c) return; // already replaced or dropped
+    call = null;
+    try { c.close(); } catch (e) {}
+    stopStats();
+    $('remoteVideo').srcObject = null;
+    if (leaving) return;
+    setStatus('The other person disconnected. Waiting for them to rejoin the same link...');
+    if (!isHost) later(1000); // the guest re-enters, and becomes host if the room is free
+  }
+
   function attachCall(c) {
     call = c;
-    let gotStream = false;
     c.on('stream', remote => {
-      gotStream = true;
       $('remoteVideo').srcObject = remote;
       setStatus('Connected');
       startStats();
     });
-    c.on('close', () => {
-      stopStats();
-      $('remoteVideo').srcObject = null;
-      if (!gotStream && roomFromUrl) setStatus('Room is full or the host left. Ask for a new link.');
-      else setStatus(roomFromUrl ? 'Call ended.' : 'The other person left. Waiting for someone to join the link...');
-      call = null;
-    });
+    c.on('close', () => dropCall(c));
     c.on('error', e => setStatus('Call error: ' + e.type));
+    // PeerJS does not always notice when the other side refreshes, so watch the connection state too
+    const watch = (tries) => {
+      const pc = c.peerConnection;
+      if (!pc) { if (tries < 5) setTimeout(() => watch(tries + 1), 300); return; }
+      let t = null;
+      pc.addEventListener('iceconnectionstatechange', () => {
+        const s = pc.iceConnectionState;
+        clearTimeout(t);
+        if (s === 'failed' || s === 'closed') dropCall(c);
+        else if (s === 'disconnected') t = setTimeout(() => dropCall(c), 5000);
+      });
+    };
+    watch(0);
   }
 
-  async function createRoom() {
-    $('lobbyMsg').textContent = '';
-    try { await getMedia(); } catch (e) { $('lobbyMsg').textContent = 'Camera/mic blocked: ' + e.message; return; }
-    const id = randomId();
-    peer = new Peer(id, { config: ICE });
-    peer.on('open', rid => {
-      showRoom();
-      const link = location.origin + location.pathname + '?room=' + rid;
-      $('linkInput').value = link; $('linkbox').style.display = 'flex';
-      history.replaceState(null, '', '?host=' + rid);
-      setStatus('Room ready. Send the link to the other person and keep this tab open.');
+  function enter() {
+    if (leaving) return;
+    if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
+    isHost = false;
+    setStatus('Connecting...');
+    const p = new Peer(roomPeerId, { config: ICE });
+    peer = p;
+    p.on('open', () => {
+      if (peer !== p) return;
+      isHost = true;
+      if (!call) setStatus('You are in the room. Waiting for the other person to open the same link...');
     });
-    peer.on('call', incoming => {
-      if (call) { incoming.close(); return; } // enforce 2-person limit
+    p.on('call', incoming => {
+      if (peer !== p) return;
+      if (call) {
+        // a refreshed person reconnecting replaces the stale call; a healthy call is never displaced (2-person limit)
+        const st = call.peerConnection && call.peerConnection.iceConnectionState;
+        if (st === 'connected' || st === 'completed') { incoming.close(); return; }
+        const old = call; call = null; try { old.close(); } catch (e) {}
+      }
       incoming.answer(sendStream);
       attachCall(incoming);
     });
-    peer.on('error', e => {
-      if (e.type === 'unavailable-id') createRoom();
+    p.on('disconnected', () => { if (peer === p && !leaving && !p.destroyed) p.reconnect(); });
+    p.on('error', e => {
+      if (peer !== p) return;
+      if (e.type === 'unavailable-id') joinAsGuest();
+      else if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(e.type)) { setStatus('Connection problem, retrying...'); later(3000); }
       else setStatus('Connection error: ' + e.type);
     });
   }
 
-  async function joinRoom(room) {
+  function joinAsGuest() {
+    if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
+    const p = new Peer({ config: ICE });
+    peer = p;
+    p.on('open', () => {
+      if (peer !== p) return;
+      const c = p.call(roomPeerId, sendStream);
+      attachCall(c);
+      setStatus('Joining the room...');
+      // no answer in time (busy room or a stale host): try again
+      setTimeout(() => { if (call === c && !c.open) dropCall(c); }, 8000);
+    });
+    p.on('error', e => {
+      if (peer !== p) return;
+      const c = call; call = null; if (c) { try { c.close(); } catch (e2) {} }
+      setStatus(e.type === 'peer-unavailable' ? 'Room is busy or the other person is reconnecting, retrying...' : 'Connection problem, retrying...');
+      later(2000);
+    });
+  }
+
+  function roomLink(secret) { return location.origin + location.pathname + '?room=' + secret; }
+
+  async function enterRoom(secret) {
+    $('lobbyMsg').textContent = '';
     try { await getMedia(); } catch (e) { $('lobbyMsg').textContent = 'Camera/mic blocked: ' + e.message; return; }
+    roomPeerId = 'duocall-' + secret;
+    try { localStorage.setItem(ROOM_KEY, secret); } catch (e) {}
+    history.replaceState(null, '', '?room=' + secret);
+    $('linkInput').value = roomLink(secret);
+    $('linkbox').style.display = 'flex';
     showRoom();
-    setStatus('Connecting...');
-    peer = new Peer({ config: ICE });
-    peer.on('open', () => attachCall(peer.call(room, sendStream)));
-    peer.on('error', e => setStatus(e.type === 'peer-unavailable' ? 'Room not found. Is the host tab still open?' : 'Connection error: ' + e.type));
+    enter();
   }
 
   // ---- controls ----
-  $('createBtn').onclick = createRoom;
   $('copyBtn').onclick = () => { navigator.clipboard.writeText($('linkInput').value); $('copyBtn').textContent = 'Copied'; setTimeout(() => $('copyBtn').textContent = 'Copy link', 1500); };
 
   $('micBtn').onclick = () => {
@@ -320,7 +378,7 @@ import { RnnoiseWorkletNode, loadRnnoise, GtcrnWorkletNode, loadGtcrn, NoiseGate
     $('shareBtn').textContent = 'Share screen'; $('shareBtn').classList.remove('off');
   }
   $('shareBtn').onclick = () => screenTrack ? stopShare() : startShare();
-  $('leaveBtn').onclick = () => { if (call) call.close(); if (peer) peer.destroy(); if (localStream) localStream.getTracks().forEach(t => t.stop()); location.href = location.pathname; };
+  $('leaveBtn').onclick = () => { leaving = true; clearTimeout(retryTimer); if (call) call.close(); if (peer) peer.destroy(); if (localStream) localStream.getTracks().forEach(t => t.stop()); location.href = location.pathname; };
 
   // ---- connection stats: shows whether the path is direct and the round-trip time ----
   function startStats() { stopStats(); statsTimer = setInterval(readStats, 2000); readStats(); }
@@ -345,10 +403,22 @@ import { RnnoiseWorkletNode, loadRnnoise, GtcrnWorkletNode, loadGtcrn, NoiseGate
       + ' | RTT ' + (rtt != null ? rtt + ' ms' : '?') + kbps;
   }
 
+  // close cleanly when the tab is refreshed or closed so the other person sees it straight away
+  addEventListener('pagehide', () => { leaving = true; try { if (call) call.close(); if (peer) peer.destroy(); } catch (e) {} });
+
   // ---- entry ----
-  if (roomFromUrl) {
-    $('lobby').innerHTML = '<p>You were invited to a call.</p><button class="primary" id="joinBtn">Join call</button><div id="lobbyMsg" class="bad"></div>';
-    $('joinBtn').onclick = () => joinRoom(roomFromUrl);
+  const validSecret = v => /^[a-z0-9]{8,40}$/i.test(v || '');
+  let savedSecret = null; try { savedSecret = localStorage.getItem(ROOM_KEY); } catch (e) {}
+  if (validSecret(roomFromUrl)) {
+    $('lobby').innerHTML = '<p>Your call room is ready. Use this same link every time.</p><button class="primary" id="enterBtn">Enter room</button><div id="lobbyMsg" class="bad"></div>';
+    $('enterBtn').onclick = () => enterRoom(roomFromUrl);
+  } else if (validSecret(savedSecret)) {
+    $('lobby').innerHTML = '<p>Welcome back.</p><button class="primary" id="enterBtn">Enter my room</button><button id="newBtn">Make a new link instead</button><div id="lobbyMsg" class="bad"></div>';
+    $('enterBtn').onclick = () => enterRoom(savedSecret);
+    $('newBtn').onclick = () => enterRoom(randomId());
+  } else {
+    $('createBtn').textContent = 'Create my room link';
+    $('createBtn').onclick = () => enterRoom(randomId());
   }
 })();
 </script>

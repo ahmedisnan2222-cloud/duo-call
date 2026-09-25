@@ -12,9 +12,15 @@ cameras need HTTPS off localhost, so use hosting below for real tests).
 Upload this folder to Netlify Drop, Cloudflare Pages or GitHub Pages. No build step.
 
 ## Use
-1. Person A opens the site, clicks Create room, sends the link.
-2. Person B opens the link, clicks Join call. A third person is rejected.
-3. Top-right shows DIRECT or RELAYED plus round-trip time (ms).
+1. The first person opens the site and clicks Create my room link. The address becomes a permanent link
+   (…/?room=<secret>). Bookmark it and send the SAME link to the other person.
+2. Both open that link and click Enter room. Whoever arrives first hosts, the other joins. Roles do not matter.
+3. Refreshing or closing a tab is fine: reopen the same link and the call reconnects. If the host leaves, the
+   other person takes over the room. A healthy call is never displaced, so a third person cannot join.
+4. Top-right shows DIRECT or RELAYED plus round-trip time (ms).
+
+The secret in the link is the only access control, so only share it with the person you want in the room.
+The browser also remembers your room (localStorage): opening the bare site offers Enter my room.
 
 ## Noise cancellation
 Three independent buttons, all running locally in the browser (nothing leaves the device):
